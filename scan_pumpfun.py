@@ -3,74 +3,36 @@ import json
 import time
 from datetime import datetime
 import threading
+from database import TokenDatabase
 
 class PumpFunScanner:
     def __init__(self):
         self.ws = None
-        self.scanned_tokens = set()
+        self.db = TokenDatabase()  # 初始化数据库连接
         
         # 设置筛选条件
         self.min_market_cap = 50000  # 最小市值(USD)
-        self.min_growth_rate = 20    # 最小增长率(%)
+        self.min_growth_rate = 10    # 最小增长率(%)
         self.min_inflow = 10000      # 最小净流入(USD)
+        
+        # 监控的代币信息
+        self.monitored_tokens = {}  # {token_address: TokenMonitor}
         
         # WebSocket连接URL
         self.ws_url = 'wss://pumpportal.fun/api/data'
-        
-        # 创建必要的文件
-        for filename in ['token_alerts.json', 'trades.json']:
-            try:
-                with open(filename, 'a') as f:
-                    pass
-            except Exception as e:
-                print(f"创建文件失败: {e}")
 
     def on_message(self, ws, message):
         try:
             data = json.loads(message)
             print(f"收到WebSocket消息: {data}")  # 调试信息
             
-            # 处理新代币事件
-            if data.get('type') == 'newToken':
-                token_info = {
-                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    'token_address': data.get('mint'),
-                    'token_name': data.get('name'),
-                    'token_symbol': data.get('symbol'),
-                    'market_cap': data.get('marketCap', 0),
-                    'growth_rate': data.get('priceChange24h', 0),
-                    'net_inflow': data.get('volume24h', 0)
-                }
-                
-                print(f"处理新代币数据: {token_info}")  # 调试信息
-                
-                # 直接写入文件，不进行筛选
-                with open('token_alerts.json', 'a') as f:
-                    json.dump(token_info, f)
-                    f.write('\n')
-                    f.flush()  # 确保立即写入
-                print(f"数据已写入文件")  # 调试信息
-                
-                # 如果需要筛选，可以在写入后再进行
-                if self.analyze_token(token_info):
-                    self.scanned_tokens.add(token_info.get('token_address'))
-                    print(f"代币已添加到已扫描集合")  # 调试信息
+            # 处理新代币创建事件
+            if data.get('txType') == 'create':  # 修改这里，使用txType而不是type
+                self.process_create(data)
             
-            # 处理交易事件
-            elif data.get('type') == 'trade':
-                trade_info = {
-                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    'token_address': data.get('mint'),
-                    'price': data.get('price'),
-                    'amount': data.get('amount'),
-                    'type': data.get('side')
-                }
-                
-                with open('trades.json', 'a') as f:
-                    json.dump(trade_info, f)
-                    f.write('\n')
-                    f.flush()  # 确保立即写入
-                
+            if data.get('txType') == 'buy' or data.get('txType') == 'sell':
+                self.process_trade(data)
+
         except Exception as e:
             print(f"处理WebSocket消息时出错: {e}")
 
@@ -104,41 +66,68 @@ class PumpFunScanner:
                 growth_rate >= self.min_growth_rate and 
                 inflow >= self.min_inflow)
 
-    def process_trade(self, trade_data):
+    def should_monitor_token(self, token_info):
+        """
+        判断是否需要监控该代币
+        TODO: 实现具体的筛选逻辑
+        """
+        # 这里添加你的筛选逻辑
+        return False
+
+    def process_trade(self, data):
         """处理交易数据"""
-        if trade_data.get('mint') not in self.scanned_tokens:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        token_address = data.get('mint')
+        if token_address in self.monitored_tokens:
+            monitor = self.monitored_tokens[token_address]
+            
             trade_info = {
-                'timestamp': timestamp,
-                'token_address': trade_data.get('mint'),
-                'price': trade_data.get('price'),
-                'amount': trade_data.get('amount'),
-                'type': trade_data.get('side')  # buy/sell
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'token_address': token_address,
+                'trader_address': data.get('traderPublicKey'),
+                'token_amount': data.get('tokenAmount', 0),
+                'sol_amount': data.get('vSolInBondingCurve', 0),
+                'market_cap': data.get('marketCapSol', 0),
+                'bonding_curve': data.get('bondingCurveKey'),
+                'v_tokens': data.get('vTokensInBondingCurve', 0),
+                'v_sol': data.get('vSolInBondingCurve', 0),
+                'type': data.get('txType'),
+                'signature': data.get('signature', '')  # 添加交易签名
             }
             
-            with open('trades.json', 'a') as f:
-                json.dump(trade_info, f)
-                f.write('\n')
+            # 存入数据库
+            self.db.add_trade(trade_info)
+            
+            # 更新监控信息
+            monitor = self.monitored_tokens[token_address]
+            monitor.update_trade(trade_info)
+            
+            # 检查是否有异常交易
+            if monitor.check_suspicious_activity():
+                self.alert_suspicious_activity(token_address, monitor)
 
-    def log_token(self, token_info):
-        """记录符合条件的代币"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_entry = {
-            'timestamp': timestamp,
-            'token_address': token_info.get('address'),
-            'token_name': token_info.get('name'),
-            'token_symbol': token_info.get('symbol'),
-            'market_cap': token_info.get('market_cap'),
-            'growth_rate': token_info.get('growth_rate'),
-            'net_inflow': token_info.get('net_inflow')
+    def process_create(self, data):
+        """处理新代币数据"""
+        token_info = {
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            'token_address': data.get('mint'),
+            'token_name': data.get('name'),
+            'token_symbol': data.get('symbol'),
+            'market_cap': data.get('marketCapSol', 0),  # 使用marketCapSol
+            'initial_buy': data.get('initialBuy', 0),   # 添加initialBuy
+            'v_tokens': data.get('vTokensInBondingCurve', 0),  # 添加代币数量
+            'v_sol': data.get('vSolInBondingCurve', 0)  # 添加SOL数量
         }
         
-        with open('token_alerts.json', 'a') as f:
-            json.dump(log_entry, f)
-            f.write('\n')
+        print(f"处理新代币数据: {token_info}")
+        
+        # 存入数据库
+        if self.db.add_new_token(token_info):
+            print(f"新代币已添加到数据库: {token_info['token_name']}")
             
-        print(f"发现新代币: {log_entry}")
-        self.scanned_tokens.add(token_info.get('address'))
+            # 判断是否需要监控
+            if self.should_monitor_token(token_info):
+                self.monitored_tokens[token_info['token_address']] = TokenMonitor(token_info)
+                print(f"开始监控代币: {token_info['token_name']}")
 
     def start_scanning(self):
         websocket.enableTrace(True)
@@ -154,3 +143,73 @@ class PumpFunScanner:
         wst = threading.Thread(target=self.ws.run_forever)
         wst.daemon = True
         wst.start()
+
+class TokenMonitor:
+    def __init__(self, token_info):
+        self.token_info = token_info
+        self.market_cap = token_info['market_cap']
+        self.trades = []
+        self.trader_stats = {}  # {trader_address: TraderStats}
+        self.last_update = datetime.now()
+        
+        # 警报阈值
+        self.large_trade_threshold = 1000  # SOL
+        self.rapid_trades_threshold = 3     # 次数
+        self.rapid_trades_window = 300      # 5分钟
+        
+    def update_trade(self, trade_info):
+        """更新交易信息"""
+        self.trades.append(trade_info)
+        self.market_cap = trade_info['market_cap']
+        
+        trader = trade_info['trader_address']
+        if trader not in self.trader_stats:
+            self.trader_stats[trader] = TraderStats()
+            
+        self.trader_stats[trader].add_trade(trade_info)
+        self.last_update = datetime.now()
+        
+    def check_suspicious_activity(self):
+        """检查可疑活动"""
+        suspicious = False
+        
+        # 检查大额交易
+        for trade in self.trades[-10:]:  # 只检查最近10笔交易
+            if trade['token_amount'] * trade['market_cap'] > self.large_trade_threshold:
+                suspicious = True
+                break
+        
+        # 检查频繁交易
+        for stats in self.trader_stats.values():
+            if stats.check_rapid_trades(self.rapid_trades_threshold, self.rapid_trades_window):
+                suspicious = True
+                break
+                
+        return suspicious
+
+class TraderStats:
+    def __init__(self):
+        self.trades = []
+        self.total_buy_amount = 0
+        self.total_sell_amount = 0
+        self.last_trade_time = None
+        
+    def add_trade(self, trade_info):
+        """添加新的交易记录"""
+        self.trades.append(trade_info)
+        self.last_trade_time = datetime.now()
+        
+        if trade_info['type'] == 'buy':
+            self.total_buy_amount += trade_info['token_amount']
+        else:
+            self.total_sell_amount += trade_info['token_amount']
+            
+    def check_rapid_trades(self, threshold, window):
+        """检查是否存在频繁交易"""
+        if len(self.trades) < threshold:
+            return False
+            
+        recent_trades = [t for t in self.trades 
+                        if (datetime.now() - datetime.strptime(t['timestamp'], "%Y-%m-%d %H:%M:%S")).seconds < window]
+        
+        return len(recent_trades) >= threshold
