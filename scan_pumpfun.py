@@ -4,22 +4,22 @@ import time
 from datetime import datetime
 import threading
 from database import TokenDatabase
+import asyncio
+from analyzer import TokenAnalyzer
 
 class PumpFunScanner:
     def __init__(self):
         self.ws = None
         self.db = TokenDatabase()  # 初始化数据库连接
         
-        # 设置筛选条件
-        self.min_market_cap = 50000  # 最小市值(USD)
-        self.min_growth_rate = 10    # 最小增长率(%)
-        self.min_inflow = 10000      # 最小净流入(USD)
-        
         # 监控的代币信息
         self.monitored_tokens = {}  # {token_address: TokenMonitor}
         
         # WebSocket连接URL
         self.ws_url = 'wss://pumpportal.fun/api/data'
+        
+        # 添加 TokenAnalyzer 实例
+        self.analyzer = TokenAnalyzer()
 
     def on_message(self, ws, message):
         try:
@@ -53,26 +53,24 @@ class PumpFunScanner:
         }
         ws.send(json.dumps(subscribe_msg))
 
-    def analyze_token(self, token_info):
-        """分析代币是否满足条件"""
-        if not token_info:
-            return False
-            
-        market_cap = token_info.get('market_cap', 0)
-        growth_rate = token_info.get('growth_rate', 0)
-        inflow = token_info.get('net_inflow', 0)
-        
-        return (market_cap >= self.min_market_cap and 
-                growth_rate >= self.min_growth_rate and 
-                inflow >= self.min_inflow)
-
-    def should_monitor_token(self, token_info):
+    async def should_monitor_token(self, token_info):
         """
         判断是否需要监控该代币
-        TODO: 实现具体的筛选逻辑
+        基于 Google 搜索结果判断
         """
-        # 这里添加你的筛选逻辑
-        return False
+        try:
+            # 获取代币的提及分析
+            analysis = await self.analyzer.analyze_token_mentions(
+                token_info['token_address'],
+                token_info['token_name']
+            )
+            
+            # 如果总提及次数超过10，则开始监控
+            return analysis['total_score'] > 10
+            
+        except Exception as e:
+            print(f"检查代币提及度时出错: {e}")
+            return False
 
     def process_trade(self, data):
         """处理交易数据"""
@@ -124,8 +122,11 @@ class PumpFunScanner:
         if self.db.add_new_token(token_info):
             print(f"新代币已添加到数据库: {token_info['token_name']}")
             
-            # 判断是否需要监控
-            if self.should_monitor_token(token_info):
+            # 使用异步方式调用 should_monitor_token
+            loop = asyncio.get_event_loop()
+            should_monitor = loop.run_until_complete(self.should_monitor_token(token_info))
+            
+            if should_monitor:
                 self.monitored_tokens[token_info['token_address']] = TokenMonitor(token_info)
                 print(f"开始监控代币: {token_info['token_name']}")
 
